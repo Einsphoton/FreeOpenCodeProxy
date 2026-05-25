@@ -26,8 +26,50 @@ const defaultSettings = {
   upstreamApiKey: process.env.UPSTREAM_API_KEY || "",
   clientApiKey: process.env.PROXY_API_KEY || "",
   defaultModel: "",
-  requestTimeoutMs: 600000
+  requestTimeoutMs: 120000
 };
+
+// 多个常见浏览器/客户端 UA，随机使用，降低被简单防代理拦截的概率
+const USER_AGENTS = [
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  "curl/8.5.0",
+  "node-fetch/1.0 (+https://github.com/) Node.js/20"
+];
+function pickUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+const RETRYABLE_NET_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND",
+  "EPIPE", "EHOSTUNREACH", "ENETUNREACH",
+  "UND_ERR_SOCKET", "UND_ERR_CLOSED", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "UND_ERR_CONNECT_TIMEOUT"
+]);
+
+function isRetryableError(error) {
+  if (!error) return false;
+  if (error.name === "AbortError") return true;
+  const code = error.code || error.cause?.code || "";
+  if (RETRYABLE_NET_CODES.has(code)) return true;
+  const msg = String(error.message || "").toLowerCase();
+  return msg.includes("fetch failed") || msg.includes("socket hang up") || msg.includes("network");
+}
+
+function diagnoseError(error) {
+  const code = error?.code || error?.cause?.code || "";
+  const name = error?.name || "Error";
+  const msg = error?.message || String(error);
+  return { name, code, message: msg };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 简单内存缓存：模型列表
+let modelsCache = { at: 0, key: "", models: [] };
+const MODELS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const defaultStats = {
   totalRequests: 0,
@@ -81,6 +123,8 @@ async function saveSettings(input) {
     requestTimeoutMs: input.requestTimeoutMs
   };
   await writeJson(settingsPath, next);
+  // 上游变更时清模型缓存
+  modelsCache = { at: 0, key: "", models: [] };
   return applyEnvOverrides(next);
 }
 
@@ -145,13 +189,14 @@ function validateSettings(input) {
   return next;
 }
 
-function openAIError(res, status, message, type = "proxy_error") {
+function openAIError(res, status, message, type = "proxy_error", extra = {}) {
   return res.status(status).json({
     error: {
       message,
       type,
       param: null,
-      code: null
+      code: null,
+      ...extra
     }
   });
 }
@@ -177,8 +222,48 @@ function buildTargetUrl(baseUrl, originalUrl) {
   return `${cleanBase}${suffix}`;
 }
 
-function forwardHeaders(req, settings) {
-  const skip = new Set(["host", "connection", "content-length", "accept-encoding"]);
+// 浏览器/真实客户端风格的请求头，用于降低被简单防代理识别的概率
+function browserLikeHeaders(targetUrl) {
+  let origin = "";
+  try {
+    const u = new URL(targetUrl);
+    origin = `${u.protocol}//${u.host}`;
+  } catch {
+    /* ignore */
+  }
+  const headers = {
+    "user-agent": pickUserAgent(),
+    "accept-language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+    "accept-encoding": "identity",
+    "cache-control": "no-cache",
+    "pragma": "no-cache"
+  };
+  if (origin) {
+    headers["origin"] = origin;
+    headers["referer"] = `${origin}/`;
+  }
+  return headers;
+}
+
+function forwardHeaders(req, settings, targetUrl) {
+  // 跳过会破坏 fetch 行为或暴露本地代理身份的头
+  const skip = new Set([
+    "host",
+    "connection",
+    "content-length",
+    "accept-encoding",
+    "user-agent",
+    "origin",
+    "referer",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "via",
+    "forwarded",
+    "cf-connecting-ip",
+    "cdn-loop"
+  ]);
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
     if (skip.has(key.toLowerCase())) continue;
@@ -186,8 +271,15 @@ function forwardHeaders(req, settings) {
     else if (value !== undefined) headers[key] = value;
   }
 
+  // 用上游 Key 覆盖客户端 Authorization；若没有上游 Key 但本地有客户端 Key，删除以免泄漏
   if (settings.upstreamApiKey) headers.authorization = `Bearer ${settings.upstreamApiKey}`;
   else if (settings.clientApiKey) delete headers.authorization;
+
+  // 注入浏览器化头
+  const fake = browserLikeHeaders(targetUrl);
+  for (const [k, v] of Object.entries(fake)) {
+    if (!headers[k]) headers[k] = v;
+  }
   return headers;
 }
 
@@ -205,10 +297,50 @@ function requestBodyForProxy(req) {
   return undefined;
 }
 
-function upstreamHeaders(settings) {
-  const headers = { accept: "application/json" };
+function upstreamHeaders(settings, targetUrl) {
+  const headers = {
+    accept: "application/json, text/event-stream;q=0.9, */*;q=0.5",
+    ...browserLikeHeaders(targetUrl)
+  };
   if (settings.upstreamApiKey) headers.authorization = `Bearer ${settings.upstreamApiKey}`;
   return headers;
+}
+
+// 带重试 + 超时的 fetch 封装
+async function fetchWithRetry(url, init, { timeoutMs, maxRetries = 3, onAttempt } = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+    const controller = new AbortController();
+    const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      if (typeof onAttempt === "function") onAttempt(attempt);
+      // 每次重试随机化 UA
+      const headers = { ...(init.headers || {}), "user-agent": pickUserAgent() };
+      const response = await fetch(url, { ...init, headers, signal: controller.signal });
+      // 5xx 或 429 视为可重试
+      if (attempt < maxRetries && (response.status === 429 || (response.status >= 500 && response.status <= 599))) {
+        const retryAfter = Number(response.headers.get("retry-after")) || 0;
+        // 释放响应避免泄漏
+        try { await response.arrayBuffer(); } catch { /* noop */ }
+        const backoff = retryAfter > 0 ? retryAfter * 1000 : Math.min(2000 * attempt, 6000) + Math.floor(Math.random() * 400);
+        await sleep(backoff);
+        lastError = new Error(`upstream HTTP ${response.status}`);
+        lastError.status = response.status;
+        continue;
+      }
+      return { response, attempts: attempt };
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxRetries || !isRetryableError(error)) {
+        throw Object.assign(error, { attempts: attempt });
+      }
+      const backoff = Math.min(1000 * attempt, 4000) + Math.floor(Math.random() * 400);
+      await sleep(backoff);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+  throw Object.assign(lastError || new Error("upstream failed"), { attempts: maxRetries });
 }
 
 function normalizeModels(payload) {
@@ -229,44 +361,49 @@ function normalizeModels(payload) {
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
-async function fetchAvailableModels(settings) {
+async function fetchAvailableModels(settings, { useCache = true } = {}) {
   if (!settings.upstreamBaseUrl) {
     const error = new Error("请先在 Settings 页面配置并保存上游 Base URL");
     error.status = 400;
     throw error;
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), settings.requestTimeoutMs || defaultSettings.requestTimeoutMs);
+  const cacheKey = `${settings.upstreamBaseUrl}|${settings.upstreamApiKey ? "with-key" : "no-key"}`;
+  const now = Date.now();
+  if (useCache && modelsCache.key === cacheKey && now - modelsCache.at < MODELS_CACHE_TTL_MS && modelsCache.models.length) {
+    return { models: modelsCache.models, fromCache: true };
+  }
+
+  const target = buildTargetUrl(settings.upstreamBaseUrl, "/v1/models");
+  const timeoutMs = Math.min(settings.requestTimeoutMs || defaultSettings.requestTimeoutMs, 60000);
   try {
-    const response = await fetch(buildTargetUrl(settings.upstreamBaseUrl, "/v1/models"), {
+    const { response } = await fetchWithRetry(target, {
       method: "GET",
-      headers: upstreamHeaders(settings),
-      signal: controller.signal
-    });
+      headers: upstreamHeaders(settings, target)
+    }, { timeoutMs, maxRetries: 3 });
     const text = await response.text();
     let payload = {};
-    try {
-      payload = text ? JSON.parse(text) : {};
-    } catch {
-      payload = {};
-    }
+    try { payload = text ? JSON.parse(text) : {}; } catch { payload = {}; }
     if (!response.ok) {
       const message = payload?.error?.message || text || `上游返回 HTTP ${response.status}`;
       const error = new Error(message);
       error.status = response.status;
       throw error;
     }
-    return normalizeModels(payload);
+    const models = normalizeModels(payload);
+    modelsCache = { at: Date.now(), key: cacheKey, models };
+    return { models, fromCache: false };
   } catch (error) {
+    // 失败时回退缓存
+    if (modelsCache.key === cacheKey && modelsCache.models.length) {
+      return { models: modelsCache.models, fromCache: true, staleError: diagnoseError(error) };
+    }
     if (error.name === "AbortError") {
       const timeoutError = new Error("读取上游模型列表超时");
       timeoutError.status = 504;
       throw timeoutError;
     }
     throw error;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -281,17 +418,23 @@ async function proxyToUpstream(req, res) {
     return openAIError(res, 400, "请先在 Settings 页面配置合法的上游 OpenAI-compatible Base URL");
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), settings.requestTimeoutMs || defaultSettings.requestTimeoutMs);
   const targetUrl = buildTargetUrl(settings.upstreamBaseUrl, req.originalUrl);
+  const timeoutMs = settings.requestTimeoutMs || defaultSettings.requestTimeoutMs;
+  // 流式只允许小幅重试（首字节前），非流式可以重试更多次
+  const maxRetries = requestedStream ? 2 : 3;
+  let attemptsTaken = 0;
 
   try {
-    const upstream = await fetch(targetUrl, {
+    const { response: upstream, attempts } = await fetchWithRetry(targetUrl, {
       method: req.method,
-      headers: forwardHeaders(req, settings),
-      body: requestBodyForProxy(req),
-      signal: controller.signal
+      headers: forwardHeaders(req, settings, targetUrl),
+      body: requestBodyForProxy(req)
+    }, {
+      timeoutMs,
+      maxRetries,
+      onAttempt: (n) => { attemptsTaken = n; }
     });
+    attemptsTaken = attempts;
 
     const contentType = upstream.headers.get("content-type") || "";
     const streamed = requestedStream || contentType.includes("text/event-stream");
@@ -307,6 +450,7 @@ async function proxyToUpstream(req, res) {
         status: upstream.status,
         ok: upstream.ok,
         streamed: true,
+        attempts: attemptsTaken,
         latencyMs: Date.now() - startedAt
       });
       Readable.fromWeb(upstream.body).pipe(res);
@@ -316,11 +460,7 @@ async function proxyToUpstream(req, res) {
     const text = await upstream.text();
     let usage = null;
     if (contentType.includes("application/json")) {
-      try {
-        usage = JSON.parse(text).usage || null;
-      } catch {
-        usage = null;
-      }
+      try { usage = JSON.parse(text).usage || null; } catch { usage = null; }
     }
 
     await recordRequest({
@@ -331,12 +471,17 @@ async function proxyToUpstream(req, res) {
       status: upstream.status,
       ok: upstream.ok,
       streamed: false,
+      attempts: attemptsTaken,
       latencyMs: Date.now() - startedAt,
       usage
     });
     return res.send(text);
   } catch (error) {
-    const message = error.name === "AbortError" ? "上游请求超时" : error.message;
+    const diag = diagnoseError(error);
+    const isTimeout = error.name === "AbortError";
+    const message = isTimeout
+      ? `上游请求超时 (${timeoutMs}ms, 已重试 ${attemptsTaken || maxRetries} 次)`
+      : `${diag.message}${diag.code ? ` [${diag.code}]` : ""} (已重试 ${attemptsTaken || maxRetries} 次)`;
     await recordRequest({
       at: new Date().toISOString(),
       method: req.method,
@@ -345,12 +490,19 @@ async function proxyToUpstream(req, res) {
       status: 502,
       ok: false,
       streamed: requestedStream,
+      attempts: attemptsTaken || maxRetries,
       latencyMs: Date.now() - startedAt,
       error: message
     });
-    return openAIError(res, 502, `Proxy upstream error: ${message}`);
-  } finally {
-    clearTimeout(timeout);
+    return openAIError(res, 502, `Proxy upstream error: ${message}`, "proxy_error", {
+      diagnostics: {
+        target: targetUrl,
+        attempts: attemptsTaken || maxRetries,
+        timeoutMs,
+        errorCode: diag.code || null,
+        errorName: diag.name
+      }
+    });
   }
 }
 
@@ -397,11 +549,17 @@ app.put("/api/settings", async (req, res, next) => {
   }
 });
 
-app.get("/api/models", async (_req, res, next) => {
+app.get("/api/models", async (req, res, next) => {
   try {
     const settings = await loadSettings();
-    const models = await fetchAvailableModels(settings);
-    res.json({ models, count: models.length });
+    const refresh = String(req.query.refresh || "") === "1";
+    const result = await fetchAvailableModels(settings, { useCache: !refresh });
+    res.json({
+      models: result.models,
+      count: result.models.length,
+      fromCache: Boolean(result.fromCache),
+      staleError: result.staleError || null
+    });
   } catch (error) {
     next(error);
   }

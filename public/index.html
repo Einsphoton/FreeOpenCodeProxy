@@ -60,7 +60,7 @@
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>时间</th><th>路径</th><th>模型</th><th>状态</th><th>延迟</th></tr>
+                <tr><th>时间</th><th>路径</th><th>模型</th><th>状态</th><th>重试</th><th>延迟</th></tr>
               </thead>
               <tbody id="requestsTable"></tbody>
             </table>
@@ -108,7 +108,7 @@
           <label>
 
             <span>请求超时（毫秒）</span>
-            <input id="requestTimeoutMs" name="requestTimeoutMs" type="number" min="1000" step="1000" />
+            <input id="requestTimeoutMs" name="requestTimeoutMs" type="number" min="1000" step="1000" placeholder="默认 120000，等同 2 分钟" />
           </label>
 
           <div id="settingsHint" class="hint"></div>

@@ -37,7 +37,7 @@ function renderCurlExample(settings) {
 function renderRequests(rows) {
   const tbody = $("#requestsTable");
   if (!rows?.length) {
-    tbody.innerHTML = `<tr><td colspan="5">暂无请求记录</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="6">暂无请求记录</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.map((row) => `
@@ -46,6 +46,7 @@ function renderRequests(rows) {
       <td>${row.path || "-"}</td>
       <td>${row.model || "-"}</td>
       <td><span class="badge ${row.ok ? "ok" : "warn"}">${row.status}</span></td>
+      <td>${row.attempts || 1}</td>
       <td>${row.latencyMs}ms</td>
     </tr>
   `).join("");
@@ -109,16 +110,24 @@ function renderModelList(filter = $("#modelSearch")?.value || "") {
   }
 }
 
-async function loadModels(showToast = true) {
+async function loadModels(showToast = true, { refresh = false } = {}) {
   try {
-    setModelListMessage("正在读取上游模型列表...");
-    const data = await api("/api/models");
+    setModelListMessage(refresh ? "正在强制刷新上游模型列表..." : "正在读取上游模型列表...");
+    const data = await api(`/api/models${refresh ? "?refresh=1" : ""}`);
     availableModels = data.models || [];
     renderModelList($("#modelSearch").value);
-    if (showToast) toast(`已读取 ${availableModels.length} 个模型`);
+    if (showToast) {
+      if (data.fromCache && data.staleError) {
+        toast(`上游暂时不可达，使用缓存的 ${availableModels.length} 个模型`);
+      } else if (data.fromCache) {
+        toast(`使用缓存：${availableModels.length} 个模型`);
+      } else {
+        toast(`已读取 ${availableModels.length} 个模型`);
+      }
+    }
   } catch (error) {
     availableModels = [];
-    setModelListMessage(error.message, "model-empty warn-text");
+    setModelListMessage(`${error.message}（可点击“读取模型”重试）`, "model-empty warn-text");
     if (showToast) toast(error.message);
   }
 }
@@ -151,7 +160,7 @@ async function loadSettings() {
     $("#clientApiKey").value = settings.hasClientApiKey ? "********" : "";
     $("#defaultModel").value = settings.defaultModel || "";
     $("#modelSearch").value = "";
-    $("#requestTimeoutMs").value = settings.requestTimeoutMs || 600000;
+    $("#requestTimeoutMs").value = settings.requestTimeoutMs || 120000;
     const locked = Object.entries(settings.envLocks || {}).filter(([, value]) => value).map(([key]) => key);
     $("#settingsHint").textContent = locked.length ? `以下配置由环境变量锁定，页面保存不会覆盖：${locked.join(", ")}` : "配置会保存到本地 data/settings.json。请只接入你有权使用的 OpenAI-compatible 上游服务。";
     renderCurlExample(settings);
@@ -185,7 +194,7 @@ async function saveSettings(event) {
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => switchPage(item.dataset.page)));
 $("#refreshBtn").addEventListener("click", loadDashboard);
 $("#reloadSettings").addEventListener("click", loadSettings);
-$("#loadModels").addEventListener("click", () => loadModels(true));
+$("#loadModels").addEventListener("click", () => loadModels(true, { refresh: true }));
 $("#modelSearch").addEventListener("input", (event) => renderModelList(event.target.value));
 $("#defaultModel").addEventListener("input", () => renderCurlExample({ ...settingsCache, defaultModel: $("#defaultModel").value }));
 $("#settingsForm").addEventListener("submit", saveSettings);
