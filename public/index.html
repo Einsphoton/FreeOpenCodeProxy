@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FreeOpenCodeProxy</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo">FO</div>
+        <div>
+          <h1>FreeOpenCodeProxy</h1>
+          <p>OpenAI-compatible Proxy</p>
+        </div>
+      </div>
+      <nav>
+        <button class="nav-item active" data-page="dashboard">Dashboard</button>
+        <button class="nav-item" data-page="settings">Settings</button>
+      </nav>
+    </aside>
+
+    <main class="main">
+      <section id="dashboard" class="page active">
+        <div class="page-title">
+          <div>
+            <p class="eyebrow">Overview</p>
+            <h2>Dashboard</h2>
+          </div>
+          <button id="refreshBtn" class="secondary">刷新</button>
+        </div>
+
+        <div class="status-card" id="statusCard">
+          <div>
+            <p class="muted">本地 OpenAI API Endpoint</p>
+            <code id="endpoint">/v1</code>
+          </div>
+          <span id="upstreamStatus" class="badge">检测中</span>
+        </div>
+
+        <div class="grid cards">
+          <article class="card"><span>总请求</span><strong id="totalRequests">0</strong></article>
+          <article class="card"><span>成功</span><strong id="successRequests">0</strong></article>
+          <article class="card"><span>失败</span><strong id="failedRequests">0</strong></article>
+          <article class="card"><span>平均延迟</span><strong id="averageLatencyMs">0ms</strong></article>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h3>调用示例</h3>
+          </div>
+          <pre id="curlExample"></pre>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h3>最近请求</h3>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>时间</th><th>路径</th><th>模型</th><th>状态</th><th>延迟</th></tr>
+              </thead>
+              <tbody id="requestsTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="settings" class="page">
+        <div class="page-title">
+          <div>
+            <p class="eyebrow">Configuration</p>
+            <h2>Settings</h2>
+          </div>
+        </div>
+
+        <form id="settingsForm" class="panel form">
+          <label>
+            <span>上游 Base URL</span>
+            <input id="upstreamBaseUrl" name="upstreamBaseUrl" placeholder="https://your-upstream.example/v1" />
+            <small>支持 OpenAI-compatible 接口；可填包含或不包含 <code>/v1</code> 的地址。</small>
+          </label>
+
+          <label>
+            <span>上游 API Key</span>
+            <input id="upstreamApiKey" name="upstreamApiKey" type="password" placeholder="留空表示不使用；输入 ******** 保持不变" />
+          </label>
+
+          <label>
+            <span>客户端访问 Key</span>
+            <input id="clientApiKey" name="clientApiKey" type="password" placeholder="可选；设置后调用本代理也需要 Bearer Key" />
+          </label>
+
+          <label>
+            <span>默认模型名</span>
+            <div class="model-row">
+              <input id="defaultModel" name="defaultModel" placeholder="例如 gpt-4o-mini 或上游支持的模型" />
+              <button type="button" id="loadModels" class="secondary">读取模型</button>
+            </div>
+            <input id="modelSearch" placeholder="搜索可用模型" autocomplete="off" />
+            <div id="modelList" class="model-list">
+              <div class="model-empty">保存上游配置后，点击“读取模型”加载可用模型。</div>
+            </div>
+          </label>
+
+          <label>
+
+            <span>请求超时（毫秒）</span>
+            <input id="requestTimeoutMs" name="requestTimeoutMs" type="number" min="1000" step="1000" />
+          </label>
+
+          <div id="settingsHint" class="hint"></div>
+          <div class="actions">
+            <button type="submit">保存配置</button>
+            <button type="button" id="reloadSettings" class="secondary">重新加载</button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <div id="toast" class="toast"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

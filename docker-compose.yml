@@ -1,0 +1,16 @@
+services:
+  free-open-code-proxy:
+    build: .
+    container_name: free-open-code-proxy
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      DATA_DIR: /app/data
+      # Optional: set these here or configure them in the Settings page.
+      # UPSTREAM_BASE_URL: "https://your-upstream.example/v1"
+      # UPSTREAM_API_KEY: "your-upstream-key"
+      # PROXY_API_KEY: "your-local-proxy-key"
+    volumes:
+      - ./data:/app/data
