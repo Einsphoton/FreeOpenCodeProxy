@@ -10,6 +10,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+// 流式（SSE）响应不需要 ETag，关闭后 Express 不会尝试缓冲响应体来算 hash
+app.disable("etag");
+// 反代场景下需要信任 X-Forwarded-* 才能拿到正确的客户端协议/IP
+app.set("trust proxy", true);
+
 const port = Number(process.env.PORT || 3000);
 const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, "data"));
 const settingsPath = path.join(dataDir, "settings.json");
@@ -284,10 +289,30 @@ function forwardHeaders(req, settings, targetUrl) {
 }
 
 function copyResponseHeaders(upstream, res) {
+  // 这些头由 Node/Express 自行管理，原样透传会出问题
   const skip = new Set(["connection", "content-encoding", "content-length", "transfer-encoding"]);
   upstream.headers.forEach((value, key) => {
     if (!skip.has(key.toLowerCase())) res.setHeader(key, value);
   });
+}
+
+// 让 SSE / 流式响应能穿透 nginx / 绿联 UGREENlink / Cloudflare 之类的反代网关
+// 不被缓冲、压缩或合并 chunk，导致客户端「秒结束 + 空内容」
+function applyStreamingHeaders(res) {
+  // 强制 SSE Content-Type（即使上游写的是别的，比如 application/octet-stream）
+  if (!String(res.getHeader("content-type") || "").includes("text/event-stream")) {
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  }
+  // 关键：让上游网关关闭 buffering / 压缩 / 转码
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("X-Accel-Buffering", "no");          // nginx 系（含 UGREENlink）
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Pragma", "no-cache");
+  // 让浏览器/中间层不要去猜内容类型
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  // 显式去除可能被上游带过来的压缩头（fetch 已自动解压，再标 encoding 会让下游二次解压失败）
+  res.removeHeader("Content-Encoding");
+  res.removeHeader("Content-Length");
 }
 
 function requestBodyForProxy(req) {
@@ -442,6 +467,15 @@ async function proxyToUpstream(req, res) {
     res.status(upstream.status);
 
     if (streamed && upstream.body) {
+      // 关键：注入抗缓冲响应头 + 立刻把 headers flush 给下游网关，
+      // 让 UGREENlink / nginx 之类的反代立即进入流式转发模式，
+      // 否则它们会缓冲整段响应，客户端表现为「立刻完成、内容为空」
+      applyStreamingHeaders(res);
+      try { res.flushHeaders?.(); } catch { /* noop */ }
+      // 关闭 Nagle，避免小 chunk 被合并造成延迟
+      try { req.socket?.setNoDelay?.(true); } catch { /* noop */ }
+      try { req.socket?.setKeepAlive?.(true); } catch { /* noop */ }
+
       await recordRequest({
         at: new Date().toISOString(),
         method: req.method,
@@ -453,7 +487,28 @@ async function proxyToUpstream(req, res) {
         attempts: attemptsTaken,
         latencyMs: Date.now() - startedAt
       });
-      Readable.fromWeb(upstream.body).pipe(res);
+
+      // 手动逐 chunk 写出 + flush，确保不被中间层合并
+      const nodeStream = Readable.fromWeb(upstream.body);
+      nodeStream.on("data", (chunk) => {
+        const ok = res.write(chunk);
+        // 写完立刻尝试 flush（Node 自带 http 没有 flush，但部分中间件/兼容层有）
+        if (typeof res.flush === "function") {
+          try { res.flush(); } catch { /* noop */ }
+        }
+        if (!ok) nodeStream.pause();
+      });
+      res.on("drain", () => nodeStream.resume());
+      nodeStream.on("end", () => res.end());
+      nodeStream.on("error", (err) => {
+        try { res.end(); } catch { /* noop */ }
+        // eslint-disable-next-line no-console
+        console.error("[stream] upstream error:", err?.message || err);
+      });
+      // 客户端断开时立刻释放上游
+      req.on("close", () => {
+        try { nodeStream.destroy(); } catch { /* noop */ }
+      });
       return;
     }
 

@@ -138,3 +138,36 @@ curl http://localhost:3000/v1/chat/completions \
 4. 通过环境变量自定义 UA 透传（高级用法）：客户端发送 `User-Agent` 不会被透传，本代理一定会改写为浏览器 UA；如需固定 UA，可以临时在 `server.js` 的 `USER_AGENTS` 里只保留一个值。
 
 > 本项目仅提供协议兼容代理与稳定性增强，不绕过任何上游服务的鉴权、配额或使用条款。请只接入你有权使用的上游服务，并自行遵守相应条款。
+
+## 通过 NAS / 反向代理网关访问（绿联 UGREENlink、Cloudflare、nginx、Traefik 等）
+
+如果你把本服务部署在 NAS 或服务器上，并通过下面这类外网网关访问：
+
+- 绿联 UGREENlink（`*.ugdocker.link`）
+- Cloudflare Tunnel / Workers
+- nginx / Caddy / Traefik 反向代理
+- Synology QuickConnect 等
+
+**症状：Web UI 能打开、`/v1/models` 也能返回，但 AI 调用「立刻完成，但内容为空」或「转一下就结束没有任何输出」。**
+
+原因：这些网关默认会对响应做 **缓冲（buffering）** 和 **gzip 压缩**，会把 OpenAI 兼容接口的 `text/event-stream` 流式响应整段吃掉，等上游写完才一次性吐给客户端，导致 SSE 解析失败 → 客户端看到「空内容、正常结束」。
+
+本项目从 v0.2 起在服务端已自动注入下面这些响应头来让网关放弃缓冲：
+
+- `Content-Type: text/event-stream; charset=utf-8`
+- `Cache-Control: no-cache, no-transform`
+- `X-Accel-Buffering: no`（nginx 系网关的标准关闭缓冲信号，绿联 UGREENlink 同样识别）
+- `Connection: keep-alive`
+- 同时立即 `flushHeaders` + 关闭 Nagle、逐 chunk 写出
+
+绝大多数网关识别这些头后会自动切到流式模式，不需要你做任何事。如果仍然不工作，请按以下顺序排查：
+
+1. **优先在网关层直接关闭对此服务的缓冲与压缩**（最稳）：
+   - nginx：`proxy_buffering off; proxy_cache off; gzip off; proxy_http_version 1.1; proxy_set_header Connection ""; chunked_transfer_encoding on;`
+   - Caddy：`flush_interval -1` 或 `reverse_proxy { flush_interval -1 }`
+   - Traefik：`buffering` 中间件不要开启
+   - Cloudflare：把该域名的 **Auto Minify / Brotli / Polish** 全关；如果用 Tunnel，确保是 HTTP/1.1 模式
+2. **不要再叠加 CDN 压缩**：响应头里我们已经声明了 `no-transform`，符合标准的中间层会遵守；不符合的（少数自建网关）需要在网关上手动关 gzip。
+3. **直接走局域网 IP**：调用方和 NAS 在同一网络时，把 base URL 改成 `http://<NAS局域网IP>:3000/v1` 即可绕过所有外网网关，性能最好。
+4. **临时排查**：在调用方关闭流式（`stream: false`）。如果非流式可用、流式不可用，那基本就是网关缓冲问题，按 1 解决；如果非流式也空，则是上游/鉴权问题，看 Dashboard 的「最近请求」诊断字段。
+
