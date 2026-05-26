@@ -331,21 +331,86 @@ function upstreamHeaders(settings, targetUrl) {
   return headers;
 }
 
-// 带重试 + 超时的 fetch 封装
-async function fetchWithRetry(url, init, { timeoutMs, maxRetries = 3, onAttempt } = {}) {
+// 带重试 + 超时 + 跟随重定向 的 fetch 封装
+// 关键：手动处理 3xx，保留 POST + body + headers（上游 CDN/WAF 经常用 302 做流量调度，
+// OpenAI 类客户端 SDK 默认不跟随 POST 重定向，会导致 chat/completions 直接挂掉）
+async function fetchWithRetry(url, init, { timeoutMs, maxRetries = 3, onAttempt, maxRedirects = 5 } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
     const controller = new AbortController();
     const timer = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
     try {
       if (typeof onAttempt === "function") onAttempt(attempt);
-      // 每次重试随机化 UA
-      const headers = { ...(init.headers || {}), "user-agent": pickUserAgent() };
-      const response = await fetch(url, { ...init, headers, signal: controller.signal });
+
+      let currentUrl = url;
+      let currentInit = init;
+      let redirectChain = [];
+      let response;
+
+      for (let hop = 0; hop <= maxRedirects; hop += 1) {
+        // 每跳随机化 UA
+        const headers = { ...(currentInit.headers || {}), "user-agent": pickUserAgent() };
+        response = await fetch(currentUrl, {
+          ...currentInit,
+          headers,
+          signal: controller.signal,
+          redirect: "manual" // 我们自己处理 3xx
+        });
+
+        const status = response.status;
+        const location = response.headers.get("location");
+
+        // 不是重定向，或没 location，跳出
+        if (status < 300 || status >= 400 || !location) break;
+        // 301/302/303/307/308 都尝试跟随
+        if (hop >= maxRedirects) {
+          // 重定向次数超限，把当前响应当作结果返回，上层会按 3xx 处理
+          break;
+        }
+
+        // 解析新 URL（支持相对路径）
+        let nextUrl;
+        try { nextUrl = new URL(location, currentUrl).toString(); } catch { break; }
+        redirectChain.push({ from: currentUrl, to: nextUrl, status });
+
+        // 释放当前响应体
+        try { await response.arrayBuffer(); } catch { /* noop */ }
+
+        // 303 永远变 GET 且丢 body；301/302 老规范说应保留方法但很多浏览器变 GET；
+        // 这里对 POST + 301/302 也强制保留 method/body（OpenAI 风控类 302 是要求原样重发）
+        let nextInit = { ...currentInit };
+        if (status === 303) {
+          nextInit.method = "GET";
+          delete nextInit.body;
+        }
+
+        // 如果跨主机，剔除 cookie/authorization 之外的"可能带敏感信息"的头，
+        // 但保留 authorization（上游同一服务商不同节点跳转时一般需要）
+        try {
+          const fromHost = new URL(currentUrl).host;
+          const toHost = new URL(nextUrl).host;
+          if (fromHost !== toHost) {
+            const h = { ...(nextInit.headers || {}) };
+            // 跨主机时 origin/referer 需要更新
+            delete h.origin;
+            delete h.referer;
+            nextInit.headers = h;
+          }
+        } catch { /* noop */ }
+
+        currentUrl = nextUrl;
+        currentInit = nextInit;
+      }
+
+      // 记录重定向链方便诊断
+      if (redirectChain.length) {
+        response._redirectChain = redirectChain;
+        response._finalUrl = currentUrl;
+      }
+
       // 5xx 或 429 视为可重试
       if (attempt < maxRetries && (response.status === 429 || (response.status >= 500 && response.status <= 599))) {
         const retryAfter = Number(response.headers.get("retry-after")) || 0;
-        // 释放响应避免泄漏
         try { await response.arrayBuffer(); } catch { /* noop */ }
         const backoff = retryAfter > 0 ? retryAfter * 1000 : Math.min(2000 * attempt, 6000) + Math.floor(Math.random() * 400);
         await sleep(backoff);
@@ -353,7 +418,7 @@ async function fetchWithRetry(url, init, { timeoutMs, maxRetries = 3, onAttempt 
         lastError.status = response.status;
         continue;
       }
-      return { response, attempts: attempt };
+      return { response, attempts: attempt, redirectChain };
     } catch (error) {
       lastError = error;
       if (attempt >= maxRetries || !isRetryableError(error)) {
@@ -450,7 +515,7 @@ async function proxyToUpstream(req, res) {
   let attemptsTaken = 0;
 
   try {
-    const { response: upstream, attempts } = await fetchWithRetry(targetUrl, {
+    const { response: upstream, attempts, redirectChain } = await fetchWithRetry(targetUrl, {
       method: req.method,
       headers: forwardHeaders(req, settings, targetUrl),
       body: requestBodyForProxy(req)
@@ -460,6 +525,12 @@ async function proxyToUpstream(req, res) {
       onAttempt: (n) => { attemptsTaken = n; }
     });
     attemptsTaken = attempts;
+    if (redirectChain?.length) {
+      // eslint-disable-next-line no-console
+      console.log(`[proxy] followed ${redirectChain.length} redirect(s):`,
+        redirectChain.map((r) => `${r.status} -> ${r.to}`).join(" | "));
+      res.setHeader("X-Proxy-Redirects", String(redirectChain.length));
+    }
 
     const contentType = upstream.headers.get("content-type") || "";
     const streamed = requestedStream || contentType.includes("text/event-stream");
